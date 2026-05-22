@@ -22,7 +22,7 @@ services:
     networks:
       - changelog_net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8123/?query=SELECT+1 || exit 1"]
+      test: ["CMD-SHELL", "curl -sf \"http://localhost:8123/?user=${CH_USER}&password=${CH_PASSWORD}&query=SELECT+1\" || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
