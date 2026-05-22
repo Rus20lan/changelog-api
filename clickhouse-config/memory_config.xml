@@ -1,0 +1,17 @@
+<clickhouse>
+  <profiles>
+    <default>
+      <max_memory_usage>268435456</max_memory_usage>
+      <max_memory_usage_for_all_queries>536870912</max_memory_usage_for_all_queries>
+      <max_threads>2</max_threads>
+      <min_insert_block_size_rows>10000</min_insert_block_size_rows>
+    </default>
+  </profiles>
+  <logger>
+    <level>warning</level>
+    <size>50M</size>
+    <count>2</count>
+  </logger>
+  <max_connections>20</max_connections>
+  <max_concurrent_queries>10</max_concurrent_queries>
+</clickhouse>

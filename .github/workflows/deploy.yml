@@ -1,0 +1,23 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            cd ~/changelog
+            git pull origin main
+            docker compose down
+            docker compose up -d --build
+            sleep 10
+            curl -sf http://localhost:8000/api/v1/health || echo "API health check failed"

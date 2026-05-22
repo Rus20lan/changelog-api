@@ -1,0 +1,60 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: changelog_clickhouse
+    restart: unless-stopped
+    expose:
+      - "8123"
+      - "9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - ./clickhouse-init:/docker-entrypoint-initdb.d
+      - ./clickhouse-config/memory_config.xml:/etc/clickhouse-server/config.d/memory_config.xml
+    environment:
+      CLICKHOUSE_USER: ${CH_USER}
+      CLICKHOUSE_PASSWORD: ${CH_PASSWORD}
+      CLICKHOUSE_DB: changelog_db
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    networks:
+      - changelog_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8123/?query=SELECT+1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  api:
+    build: ./api
+    container_name: changelog_api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      CH_HOST: clickhouse
+      CH_PORT: "8123"
+      CH_USER: ${CH_USER}
+      CH_PASSWORD: ${CH_PASSWORD}
+      CH_DB: changelog_db
+      API_KEY: ${API_KEY}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - changelog_net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  clickhouse_data:
+  clickhouse_logs:
+
+networks:
+  changelog_net:
+    driver: bridge
