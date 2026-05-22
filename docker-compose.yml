@@ -1,7 +1,6 @@
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.3-alpine
-    container_name: changelog_clickhouse
     restart: unless-stopped
     expose:
       - "8123"
@@ -30,10 +29,9 @@ services:
 
   api:
     build: ./api
-    container_name: changelog_api
     restart: unless-stopped
-    ports:
-      - "${API_PORT:-8000}:8000"
+    expose:
+      - "8000"
     environment:
       CH_HOST: clickhouse
       CH_PORT: "8123"
@@ -46,6 +44,9 @@ services:
         condition: service_healthy
     networks:
       - changelog_net
+      proxy_net:
+        aliases:
+          - changelog-api
     deploy:
       resources:
         limits:
@@ -58,3 +59,6 @@ volumes:
 networks:
   changelog_net:
     driver: bridge
+  proxy_net:
+    external: true
+    name: ${PROXY_NETWORK:-npm_default}

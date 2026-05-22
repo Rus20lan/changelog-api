@@ -122,8 +122,10 @@ docker compose up -d --build
 4. Проверьте здоровье API:
 
 ```powershell
-curl http://localhost:8000/api/v1/health
+docker compose ps
 ```
+
+По умолчанию `docker-compose.yml` не публикует API наружу. Это удобно для production-сценария, когда наружный доступ дает reverse proxy вроде `Nginx Proxy Manager`.
 
 ## Локальный запуск API без Docker
 
