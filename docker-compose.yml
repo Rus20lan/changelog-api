@@ -43,7 +43,7 @@ services:
       clickhouse:
         condition: service_healthy
     networks:
-      - changelog_net
+      changelog_net: {}
       proxy_net:
         aliases:
           - changelog-api
