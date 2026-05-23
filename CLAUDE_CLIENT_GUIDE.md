@@ -94,6 +94,41 @@ curl -X PATCH "https://api.cadkocomatozze.ru/api/v1/changelog/PROJECT_NAME/LOG_I
   }'
 ```
 
+### 7. Если нужно удалить выбранные версии
+
+Сначала получить список:
+
+```bash
+curl -H "X-Api-Key: YOUR_API_KEY" \
+  "https://api.cadkocomatozze.ru/api/v1/project/PROJECT_NAME/versions"
+```
+
+Потом удалить нужные:
+
+```bash
+curl -X DELETE "https://api.cadkocomatozze.ru/api/v1/project/PROJECT_NAME/versions" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -d '{
+    "versions": [2, 3]
+  }'
+```
+
+### 8. Если нужно удалить весь проект
+
+```bash
+curl -X DELETE "https://api.cadkocomatozze.ru/api/v1/project/PROJECT_NAME" \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+### 9. Если нужно полностью очистить базу
+
+```bash
+curl -X DELETE "https://api.cadkocomatozze.ru/api/v1/admin/purge" \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "X-Confirm: PURGE-ALL"
+```
+
 ## Полезные чтения
 
 Последняя версия проекта:
@@ -151,3 +186,4 @@ postpone
 3. классификация
 4. `POST /changelog`
 5. `POST /strategic`
+6. при необходимости `GET /project/{project_name}/versions` -> `DELETE /project/{project_name}/versions`

@@ -166,3 +166,7 @@ class StrategicRequest(BaseSchema):
     project_name: str
     snapshot_version: int
     entries: list[StrategicEntryIn]
+
+
+class DeleteVersionsRequest(BaseSchema):
+    versions: list[int] = Field(min_length=1)

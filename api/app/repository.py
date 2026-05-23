@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 import requests
 
 from .config import settings
-from .logic import serialize_record
+from .logic import date_diff, serialize_record
 
 
 SNAPSHOT_COLUMNS = [
@@ -169,6 +169,9 @@ class ClickHouseRepository:
         )
         return [row["name"] for row in rows]
 
+    def _alter_delete(self, table_name: str, where_clause: str) -> None:
+        self.execute(f"ALTER TABLE {table_name} DELETE WHERE {where_clause}")
+
     def get_latest_snapshot_version(self, project_name: str) -> int:
         value = self.query_scalar(
             "SELECT max(snapshot_version) AS value "
@@ -245,6 +248,28 @@ class ClickHouseRepository:
             f"AND snapshot_version = {version}"
         )
         return value
+
+    def list_project_versions(self, project_name: str) -> list[dict[str, Any]]:
+        rows = self.query_rows(
+            "SELECT snapshot_version AS version, any(status_date) AS status_date, "
+            "count() AS tasks_count, max(parsed_at) AS parsed_at "
+            "FROM snapshots FINAL "
+            f"WHERE project_name = '{escape_sql_string(project_name)}' "
+            "GROUP BY snapshot_version "
+            "ORDER BY snapshot_version"
+        )
+        versions: list[dict[str, Any]] = []
+        for row in rows:
+            serialized = serialize_record(row)
+            version = int(serialized["version"])
+            changelog_count = self.query_scalar(
+                "SELECT count() AS value FROM change_log FINAL "
+                f"WHERE project_name = '{escape_sql_string(project_name)}' "
+                f"AND (snapshot_from = {version} OR snapshot_to = {version})"
+            )
+            serialized["has_changelog"] = int(changelog_count or 0) > 0
+            versions.append(serialized)
+        return versions
 
     def insert_changelog_entries(self, entries: list[dict[str, Any]]) -> None:
         values = []
@@ -336,6 +361,160 @@ class ClickHouseRepository:
             "FROM classifier ORDER BY code"
         )
         return [serialize_record(row) for row in rows]
+
+    def purge_all_data(self) -> dict[str, bool]:
+        tables = ["snapshots", "project_meta", "strategic_control", "change_log"]
+        for table_name in tables:
+            self._alter_delete(table_name, "1 = 1")
+        return {table_name: True for table_name in tables}
+
+    def delete_project_data(self, project_name: str) -> None:
+        escaped = escape_sql_string(project_name)
+        condition = f"project_name = '{escaped}'"
+        for table_name in ["snapshots", "project_meta", "strategic_control", "change_log"]:
+            self._alter_delete(table_name, condition)
+
+    def _get_project_versions_numbers(self, project_name: str) -> list[int]:
+        rows = self.query_rows(
+            "SELECT DISTINCT snapshot_version AS version FROM snapshots FINAL "
+            f"WHERE project_name = '{escape_sql_string(project_name)}' "
+            "ORDER BY version"
+        )
+        return [int(row["version"]) for row in rows]
+
+    def _build_project_meta_from_latest_snapshot(
+        self, project_name: str, latest_version: int
+    ) -> dict[str, Any]:
+        existing_meta = self.get_project_meta(project_name) or {}
+        aggregate = self.query_row(
+            "SELECT any(status_date) AS status_date, "
+            "count() AS total_tasks, "
+            "countIf(summary = 'Y') AS summary_tasks, "
+            "countIf(milestone = 'Y') AS milestones, "
+            "countIf(summary = 'N') AS leaf_tasks, "
+            "countIf(baseline_finish IS NOT NULL) AS with_baseline "
+            "FROM snapshots FINAL "
+            f"WHERE project_name = '{escape_sql_string(project_name)}' "
+            f"AND snapshot_version = {latest_version}"
+        )
+        if aggregate is None:
+            raise ClickHouseError("ClickHouse error: latest snapshot aggregate not found")
+
+        aggregate = serialize_record(aggregate)
+        return {
+            "project_name": project_name,
+            "ms_project_name": existing_meta.get("ms_project_name", ""),
+            "status_date": aggregate["status_date"],
+            "project_start": existing_meta.get("project_start"),
+            "project_finish": existing_meta.get("project_finish"),
+            "last_version": latest_version,
+            "total_tasks": int(aggregate["total_tasks"]),
+            "summary_tasks": int(aggregate["summary_tasks"]),
+            "milestones": int(aggregate["milestones"]),
+            "leaf_tasks": int(aggregate["leaf_tasks"]),
+            "with_baseline": int(aggregate["with_baseline"]),
+            "total_resources": int(existing_meta.get("total_resources", 0) or 0),
+        }
+
+    def _rebuild_strategic_for_latest_version(self, project_name: str, latest_version: int) -> None:
+        escaped = escape_sql_string(project_name)
+        self._alter_delete("strategic_control", f"project_name = '{escaped}'")
+
+        rows = self.get_snapshot_rows(project_name, latest_version)
+        entries = []
+        for row in rows:
+            if row.get("summary", "N") != "Y":
+                continue
+            entries.append(
+                {
+                    "project_name": project_name,
+                    "uid": int(row["uid"]),
+                    "wbs": row.get("wbs", ""),
+                    "name": row.get("name", ""),
+                    "summary": row.get("summary", "N"),
+                    "baseline_finish": row.get("baseline_finish"),
+                    "current_finish": row.get("finish"),
+                    "delta_baseline_days": date_diff(
+                        row.get("baseline_finish"), row.get("finish")
+                    ),
+                    "escalation": date_diff(row.get("baseline_finish"), row.get("finish")) != 0,
+                    "ai_strategic_analysis": "",
+                    "snapshot_version": latest_version,
+                }
+            )
+
+        if entries:
+            self.insert_strategic_entries(entries)
+
+    def delete_project_versions(self, project_name: str, versions: list[int]) -> dict[str, Any]:
+        escaped = escape_sql_string(project_name)
+        existing_versions = self._get_project_versions_numbers(project_name)
+        requested_versions = sorted(set(versions))
+
+        changelog_entries_deleted = int(
+            self.query_scalar(
+                "SELECT count() AS value FROM change_log FINAL "
+                f"WHERE project_name = '{escaped}' "
+                f"AND (snapshot_from IN ({', '.join(str(v) for v in requested_versions)}) "
+                f"OR snapshot_to IN ({', '.join(str(v) for v in requested_versions)}))"
+            )
+            or 0
+        )
+        strategic_entries_deleted = int(
+            self.query_scalar(
+                "SELECT count() AS value FROM strategic_control FINAL "
+                f"WHERE project_name = '{escaped}' "
+                f"AND snapshot_version IN ({', '.join(str(v) for v in requested_versions)})"
+            )
+            or 0
+        )
+
+        versions_clause = ", ".join(str(version) for version in requested_versions)
+        self._alter_delete(
+            "snapshots",
+            f"project_name = '{escaped}' AND snapshot_version IN ({versions_clause})",
+        )
+        self._alter_delete(
+            "change_log",
+            f"project_name = '{escaped}' AND (snapshot_from IN ({versions_clause}) "
+            f"OR snapshot_to IN ({versions_clause}))",
+        )
+        self._alter_delete(
+            "strategic_control",
+            f"project_name = '{escaped}' AND snapshot_version IN ({versions_clause})",
+        )
+
+        remaining_versions = [version for version in existing_versions if version not in requested_versions]
+        deleted_latest = bool(existing_versions) and max(existing_versions) in requested_versions
+
+        if not remaining_versions:
+            self._alter_delete("project_meta", f"project_name = '{escaped}'")
+            self._alter_delete("strategic_control", f"project_name = '{escaped}'")
+        else:
+            latest_remaining = max(remaining_versions)
+            self.upsert_project_meta(
+                self._build_project_meta_from_latest_snapshot(project_name, latest_remaining)
+            )
+            if deleted_latest:
+                self._rebuild_strategic_for_latest_version(project_name, latest_remaining)
+
+        return {
+            "status": "ok",
+            "action": "delete_versions",
+            "project_name": project_name,
+            "deleted_versions": requested_versions,
+            "remaining_versions": remaining_versions,
+            "changelog_entries_deleted": changelog_entries_deleted,
+            "strategic_entries_deleted": strategic_entries_deleted,
+            "message": (
+                f"Удалены версии {', '.join(str(v) for v in requested_versions)}. "
+                + (
+                    f"Остались версии {', '.join(str(v) for v in remaining_versions)}."
+                    if remaining_versions
+                    else "Версий проекта не осталось."
+                )
+            ),
+        }
 
 
 _repository: ClickHouseRepository | None = None

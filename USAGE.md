@@ -379,6 +379,94 @@ curl -H "X-Api-Key: YOUR_API_KEY" \
   "https://api.cadkocomatozze.ru/api/v1/meta/Пилот-2026"
 ```
 
+## 12. Список версий проекта
+
+Эндпоинт:
+
+```text
+GET /api/v1/project/{project_name}/versions
+```
+
+Пример:
+
+```bash
+curl -H "X-Api-Key: YOUR_API_KEY" \
+  "https://api.cadkocomatozze.ru/api/v1/project/Пилот-2026/versions"
+```
+
+Используйте этот запрос перед частичным удалением, чтобы показать пользователю доступные версии.
+
+## 13. Удаление выбранных версий
+
+Эндпоинт:
+
+```text
+DELETE /api/v1/project/{project_name}/versions
+```
+
+Пример:
+
+```bash
+curl -X DELETE "https://api.cadkocomatozze.ru/api/v1/project/Пилот-2026/versions" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -d '{
+    "versions": [2, 3]
+  }'
+```
+
+Важно:
+
+- удаляются снапшоты, связанные записи `change_log` и соответствующие записи `strategic_control`;
+- дельты между оставшимися версиями автоматически не пересчитываются;
+- если удалена последняя версия, `project_meta.last_version` обновляется на новую максимальную версию.
+
+## 14. Удаление проекта целиком
+
+Эндпоинт:
+
+```text
+DELETE /api/v1/project/{project_name}
+```
+
+Пример:
+
+```bash
+curl -X DELETE "https://api.cadkocomatozze.ru/api/v1/project/Пилот-2026" \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+Этот вызов удаляет проект из:
+
+- `snapshots`
+- `project_meta`
+- `strategic_control`
+- `change_log`
+
+## 15. Полная очистка базы
+
+Эндпоинт:
+
+```text
+DELETE /api/v1/admin/purge
+```
+
+Для защиты от случайного вызова требуется дополнительный заголовок:
+
+```text
+X-Confirm: PURGE-ALL
+```
+
+Пример:
+
+```bash
+curl -X DELETE "https://api.cadkocomatozze.ru/api/v1/admin/purge" \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "X-Confirm: PURGE-ALL"
+```
+
+Это необратимая операция: она очищает все данные из рабочих таблиц сервиса.
+
 ## Практический рабочий цикл
 
 Ниже удобный реальный шаблон использования:
@@ -390,6 +478,7 @@ curl -H "X-Api-Key: YOUR_API_KEY" \
 5. Сохранить классификацию в `POST /changelog`.
 6. Отдельно сохранить стратегические summary-задачи в `POST /strategic`.
 7. Если эксперт скорректировал причину, обновить запись через `PATCH /changelog/.../status`.
+8. Если нужно удалить мусорные версии, сначала запросить `GET /project/{project_name}/versions`, затем вызвать `DELETE /project/{project_name}/versions`.
 
 ## Типовые ошибки
 

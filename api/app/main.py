@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -13,6 +13,7 @@ from .models import (
     CHANGE_STATUSES,
     ChangelogRequest,
     ChangelogStatusPatchRequest,
+    DeleteVersionsRequest,
     SnapshotRequest,
     StrategicRequest,
 )
@@ -248,6 +249,79 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/classifier")
     def get_classifier(_: AuthDep, repository: RepositoryDep) -> dict[str, Any]:
         return {"codes": repository.list_classifier_codes()}
+
+    @app.delete("/api/v1/admin/purge")
+    def purge_all_data(
+        _: AuthDep,
+        repository: RepositoryDep,
+        x_confirm: str | None = Header(default=None, alias="X-Confirm"),
+    ) -> dict[str, Any]:
+        if x_confirm != "PURGE-ALL":
+            raise HTTPException(
+                status_code=400,
+                detail="Header X-Confirm: PURGE-ALL is required",
+            )
+        deleted = repository.purge_all_data()
+        return {
+            "status": "ok",
+            "action": "purge_all",
+            "deleted": deleted,
+            "message": "Все данные удалены",
+        }
+
+    @app.delete("/api/v1/project/{project_name}")
+    def delete_project(
+        project_name: str, _: AuthDep, repository: RepositoryDep
+    ) -> dict[str, Any]:
+        if repository.get_latest_snapshot_version(project_name) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Проект '{project_name}' не найден в базе данных",
+            )
+        repository.delete_project_data(project_name)
+        return {
+            "status": "ok",
+            "action": "delete_project",
+            "project_name": project_name,
+            "message": f"Проект {project_name} полностью удалён",
+        }
+
+    @app.get("/api/v1/project/{project_name}/versions")
+    def get_project_versions(
+        project_name: str, _: AuthDep, repository: RepositoryDep
+    ) -> dict[str, Any]:
+        versions = repository.list_project_versions(project_name)
+        if not versions:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Проект '{project_name}' не найден в базе данных",
+            )
+        return {"project_name": project_name, "versions": versions}
+
+    @app.delete("/api/v1/project/{project_name}/versions")
+    def delete_project_versions(
+        project_name: str,
+        payload: DeleteVersionsRequest,
+        _: AuthDep,
+        repository: RepositoryDep,
+    ) -> dict[str, Any]:
+        available_versions = repository.list_project_versions(project_name)
+        if not available_versions:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Проект '{project_name}' не найден в базе данных",
+            )
+
+        existing_versions = {int(item["version"]) for item in available_versions}
+        requested_versions = sorted(set(payload.versions))
+        missing_versions = [version for version in requested_versions if version not in existing_versions]
+        if missing_versions:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Версии не найдены: {missing_versions}",
+            )
+
+        return repository.delete_project_versions(project_name, requested_versions)
 
     return app
 

@@ -4,6 +4,7 @@ from datetime import date
 
 from fastapi.testclient import TestClient
 
+from app.logic import date_diff
 from app.main import app
 from app.repository import get_repository
 
@@ -27,13 +28,19 @@ class FakeRepository:
         return self.tables
 
     def get_latest_snapshot_version(self, project_name: str) -> int:
-        versions = [version for current_project, version in self.snapshot_rows if current_project == project_name]
+        versions = [
+            version for current_project, version in self.snapshot_rows if current_project == project_name
+        ]
         return max(versions, default=0)
 
     def insert_snapshot_rows(self, rows: list[dict], batch_size: int = 100) -> None:
         for row in rows:
             key = (row["project_name"], row["snapshot_version"])
-            self.snapshot_rows.setdefault(key, []).append(row)
+            prepared = {
+                **row,
+                "parsed_at": row.get("parsed_at", "2026-05-22T10:00:00"),
+            }
+            self.snapshot_rows.setdefault(key, []).append(prepared)
 
     def upsert_project_meta(self, meta: dict) -> None:
         self.project_meta[meta["project_name"]] = {
@@ -45,7 +52,9 @@ class FakeRepository:
     def get_project_meta(self, project_name: str) -> dict | None:
         return self.project_meta.get(project_name)
 
-    def get_snapshot_rows(self, project_name: str, version: int, limit: int | None = None) -> list[dict]:
+    def get_snapshot_rows(
+        self, project_name: str, version: int, limit: int | None = None
+    ) -> list[dict]:
         rows = self.snapshot_rows.get((project_name, version), [])
         prepared = []
         for row in rows[: limit or None]:
@@ -55,10 +64,16 @@ class FakeRepository:
                     "status_date": row["status_date"].isoformat(),
                     "start": row["start"].isoformat() if row["start"] else None,
                     "finish": row["finish"].isoformat() if row["finish"] else None,
-                    "baseline_start": row["baseline_start"].isoformat() if row["baseline_start"] else None,
-                    "baseline_finish": row["baseline_finish"].isoformat() if row["baseline_finish"] else None,
+                    "baseline_start": row["baseline_start"].isoformat()
+                    if row["baseline_start"]
+                    else None,
+                    "baseline_finish": row["baseline_finish"].isoformat()
+                    if row["baseline_finish"]
+                    else None,
                     "actual_start": row["actual_start"].isoformat() if row["actual_start"] else None,
-                    "actual_finish": row["actual_finish"].isoformat() if row["actual_finish"] else None,
+                    "actual_finish": row["actual_finish"].isoformat()
+                    if row["actual_finish"]
+                    else None,
                 }
             )
         return prepared
@@ -71,6 +86,29 @@ class FakeRepository:
         if not rows:
             return None
         return rows[0]["status_date"].isoformat()
+
+    def list_project_versions(self, project_name: str) -> list[dict]:
+        versions = []
+        for (current_project, version), rows in sorted(
+            self.snapshot_rows.items(), key=lambda item: item[0][1]
+        ):
+            if current_project != project_name or not rows:
+                continue
+            has_changelog = any(
+                entry["snapshot_from"] == version or entry["snapshot_to"] == version
+                for (entry_project, _), entry in self.changelog_entries.items()
+                if entry_project == project_name
+            )
+            versions.append(
+                {
+                    "version": version,
+                    "status_date": rows[0]["status_date"].isoformat(),
+                    "tasks_count": len(rows),
+                    "parsed_at": rows[0]["parsed_at"],
+                    "has_changelog": has_changelog,
+                }
+            )
+        return versions
 
     def insert_changelog_entries(self, entries: list[dict]) -> None:
         for entry in entries:
@@ -112,8 +150,12 @@ class FakeRepository:
         self.strategic_entries[project_name] = [
             {
                 **entry,
-                "baseline_finish": entry["baseline_finish"].isoformat() if entry["baseline_finish"] else None,
-                "current_finish": entry["current_finish"].isoformat() if entry["current_finish"] else None,
+                "baseline_finish": entry["baseline_finish"].isoformat()
+                if hasattr(entry["baseline_finish"], "isoformat") and entry["baseline_finish"]
+                else entry["baseline_finish"],
+                "current_finish": entry["current_finish"].isoformat()
+                if hasattr(entry["current_finish"], "isoformat") and entry["current_finish"]
+                else entry["current_finish"],
                 "updated_at": "2026-05-22T10:00:00",
             }
             for entry in entries
@@ -125,6 +167,135 @@ class FakeRepository:
     def list_classifier_codes(self) -> list[dict]:
         return self.classifier_codes
 
+    def purge_all_data(self) -> dict[str, bool]:
+        self.snapshot_rows.clear()
+        self.project_meta.clear()
+        self.changelog_entries.clear()
+        self.strategic_entries.clear()
+        return {
+            "snapshots": True,
+            "project_meta": True,
+            "strategic_control": True,
+            "change_log": True,
+        }
+
+    def delete_project_data(self, project_name: str) -> None:
+        self.snapshot_rows = {
+            key: value for key, value in self.snapshot_rows.items() if key[0] != project_name
+        }
+        self.project_meta.pop(project_name, None)
+        self.strategic_entries.pop(project_name, None)
+        self.changelog_entries = {
+            key: value
+            for key, value in self.changelog_entries.items()
+            if key[0] != project_name
+        }
+
+    def delete_project_versions(self, project_name: str, versions: list[int]) -> dict:
+        existing_versions = sorted(
+            [version for current_project, version in self.snapshot_rows if current_project == project_name]
+        )
+        requested = sorted(set(versions))
+        deleted_latest = bool(existing_versions) and max(existing_versions) in requested
+
+        changelog_entries_deleted = sum(
+            1
+            for (current_project, _), entry in self.changelog_entries.items()
+            if current_project == project_name
+            and (entry["snapshot_from"] in requested or entry["snapshot_to"] in requested)
+        )
+        strategic_entries_deleted = sum(
+            1
+            for entry in self.strategic_entries.get(project_name, [])
+            if entry["snapshot_version"] in requested
+        )
+
+        self.snapshot_rows = {
+            key: value
+            for key, value in self.snapshot_rows.items()
+            if not (key[0] == project_name and key[1] in requested)
+        }
+        self.changelog_entries = {
+            key: value
+            for key, value in self.changelog_entries.items()
+            if not (
+                key[0] == project_name
+                and (value["snapshot_from"] in requested or value["snapshot_to"] in requested)
+            )
+        }
+
+        self.strategic_entries[project_name] = [
+            entry
+            for entry in self.strategic_entries.get(project_name, [])
+            if entry["snapshot_version"] not in requested
+        ]
+
+        remaining_versions = [version for version in existing_versions if version not in requested]
+        if not remaining_versions:
+            self.project_meta.pop(project_name, None)
+            self.strategic_entries.pop(project_name, None)
+        else:
+            latest_version = max(remaining_versions)
+            rows = self.snapshot_rows[(project_name, latest_version)]
+            current_meta = self.project_meta.get(project_name, {})
+            self.project_meta[project_name] = {
+                **current_meta,
+                "project_name": project_name,
+                "status_date": rows[0]["status_date"],
+                "last_version": latest_version,
+                "total_tasks": len(rows),
+                "summary_tasks": sum(1 for row in rows if row["summary"] == "Y"),
+                "milestones": sum(1 for row in rows if row["milestone"] == "Y"),
+                "leaf_tasks": sum(1 for row in rows if row["summary"] == "N"),
+                "with_baseline": sum(1 for row in rows if row["baseline_finish"] is not None),
+                "updated_at": "2026-05-22T10:00:00",
+                "last_parsed_at": "2026-05-22T10:00:00",
+            }
+            if deleted_latest:
+                rebuilt = []
+                for row in rows:
+                    if row["summary"] != "Y":
+                        continue
+                    rebuilt.append(
+                        {
+                            "project_name": project_name,
+                            "uid": row["uid"],
+                            "wbs": row["wbs"],
+                            "name": row["name"],
+                            "summary": row["summary"],
+                            "baseline_finish": row["baseline_finish"].isoformat()
+                            if row["baseline_finish"]
+                            else None,
+                            "current_finish": row["finish"].isoformat() if row["finish"] else None,
+                            "delta_baseline_days": date_diff(
+                                row["baseline_finish"], row["finish"]
+                            ),
+                            "escalation": date_diff(row["baseline_finish"], row["finish"]) != 0,
+                            "ai_strategic_analysis": "",
+                            "snapshot_version": latest_version,
+                            "updated_at": "2026-05-22T10:00:00",
+                        }
+                    )
+                self.strategic_entries[project_name] = rebuilt
+
+        return {
+            "status": "ok",
+            "action": "delete_versions",
+            "project_name": project_name,
+            "deleted_versions": requested,
+            "remaining_versions": remaining_versions,
+            "changelog_entries_deleted": changelog_entries_deleted,
+            "strategic_entries_deleted": strategic_entries_deleted,
+            "message": (
+                f"Удалены версии {', '.join(str(version) for version in requested)}. "
+                + (
+                    f"Остались версии {', '.join(str(version) for version in remaining_versions)}."
+                    if remaining_versions
+                    else "Версий проекта не осталось."
+                )
+            ),
+        }
+
 
 def make_client() -> tuple[TestClient, FakeRepository]:
     repository = FakeRepository()
@@ -134,6 +305,43 @@ def make_client() -> tuple[TestClient, FakeRepository]:
 
 def auth_headers() -> dict[str, str]:
     return {"X-Api-Key": "dev-api-key-please-change-me-32chars"}
+
+
+def build_snapshot_payload(
+    project_name: str, status_date: str, uid: int, name: str = "Задача", summary: str = "Y"
+) -> dict:
+    return {
+        "project_name": project_name,
+        "status_date": status_date,
+        "rows": [
+            {
+                "UID": uid,
+                "ID": uid,
+                "WBS": "1",
+                "Name": name,
+                "Level": 1,
+                "Outline": "1",
+                "Parent_UID": 0,
+                "Summary": summary,
+                "Milestone": "N",
+                "Start": status_date,
+                "Finish": status_date,
+                "Baseline_Start": status_date,
+                "Baseline_Finish": status_date,
+                "Duration": "1d",
+                "Pct_Complete": 0,
+                "Actual_Start": None,
+                "Actual_Finish": None,
+                "Cost": 0,
+                "Baseline_Cost": 0,
+                "Work": 0,
+                "Baseline_Work": 0,
+                "Predecessors": "",
+                "Resources": "",
+                "Notes": "",
+            }
+        ],
+    }
 
 
 def test_health() -> None:
@@ -362,3 +570,143 @@ def test_changelog_status_patch() -> None:
     entry = list_response.json()["entries"][0]
     assert entry["status"] == "Corrected"
     assert entry["category_code"] == "DELAY-INT"
+
+
+def test_admin_purge_requires_confirmation() -> None:
+    client, _ = make_client()
+    response = client.delete("/api/v1/admin/purge", headers=auth_headers())
+    assert response.status_code == 400
+    assert "X-Confirm" in response.json()["detail"]
+
+
+def test_admin_purge_clears_data() -> None:
+    client, repository = make_client()
+    client.post(
+        "/api/v1/snapshot",
+        headers=auth_headers(),
+        json=build_snapshot_payload("Пилот-2026", "2026-02-01", 1),
+    )
+    response = client.delete(
+        "/api/v1/admin/purge",
+        headers={**auth_headers(), "X-Confirm": "PURGE-ALL"},
+    )
+    assert response.status_code == 200
+    assert response.json()["action"] == "purge_all"
+    assert repository.snapshot_rows == {}
+
+
+def test_get_versions_and_delete_versions() -> None:
+    client, repository = make_client()
+    client.post(
+        "/api/v1/snapshot",
+        headers=auth_headers(),
+        json=build_snapshot_payload("ИМТГФА", "2026-04-26", 1),
+    )
+    client.post(
+        "/api/v1/snapshot",
+        headers=auth_headers(),
+        json=build_snapshot_payload("ИМТГФА", "2026-05-10", 2),
+    )
+    client.post(
+        "/api/v1/snapshot",
+        headers=auth_headers(),
+        json=build_snapshot_payload("ИМТГФА", "2026-05-20", 3),
+    )
+    client.post(
+        "/api/v1/changelog",
+        headers=auth_headers(),
+        json={
+            "project_name": "ИМТГФА",
+            "entries": [
+                {
+                    "log_id": "ИМТГФА_2_3_3",
+                    "snapshot_from": 2,
+                    "snapshot_to": 3,
+                    "date": "2026-05-20",
+                    "uid": 3,
+                    "wbs": "1",
+                    "name": "Задача",
+                    "level": 1,
+                    "change_type": "increase",
+                    "delta_start_days": 0,
+                    "delta_finish_days": 10,
+                    "delta_baseline_days": 10,
+                    "category_code": "DELAY-EXT",
+                    "technical_summary": "test",
+                    "impact_type": "Задержка",
+                    "confidence": 0.8,
+                    "warnings": "",
+                    "escalation_required": False,
+                    "expert_comment": "",
+                    "status": "Auto",
+                }
+            ],
+        },
+    )
+    repository.insert_strategic_entries(
+        [
+            {
+                "project_name": "ИМТГФА",
+                "uid": 3,
+                "wbs": "1",
+                "name": "Задача",
+                "summary": "Y",
+                "baseline_finish": "2026-05-20",
+                "current_finish": "2026-05-20",
+                "delta_baseline_days": 0,
+                "escalation": False,
+                "ai_strategic_analysis": "",
+                "snapshot_version": 3,
+            }
+        ]
+    )
+
+    versions_response = client.get("/api/v1/project/ИМТГФА/versions", headers=auth_headers())
+    assert versions_response.status_code == 200
+    assert [item["version"] for item in versions_response.json()["versions"]] == [1, 2, 3]
+    assert versions_response.json()["versions"][1]["has_changelog"] is True
+
+    delete_response = client.request(
+        "DELETE",
+        "/api/v1/project/ИМТГФА/versions",
+        headers=auth_headers(),
+        json={"versions": [2, 3]},
+    )
+    assert delete_response.status_code == 200
+    assert delete_response.json()["deleted_versions"] == [2, 3]
+    assert delete_response.json()["remaining_versions"] == [1]
+    assert delete_response.json()["changelog_entries_deleted"] == 1
+    assert repository.project_meta["ИМТГФА"]["last_version"] == 1
+
+
+def test_delete_versions_returns_missing_versions() -> None:
+    client, _ = make_client()
+    client.post(
+        "/api/v1/snapshot",
+        headers=auth_headers(),
+        json=build_snapshot_payload("ИМТГФА", "2026-04-26", 1),
+    )
+    response = client.request(
+        "DELETE",
+        "/api/v1/project/ИМТГФА/versions",
+        headers=auth_headers(),
+        json={"versions": [4, 5]},
+    )
+    assert response.status_code == 404
+    assert "Версии не найдены" in response.json()["detail"]
+
+
+def test_delete_project_not_found_and_success() -> None:
+    client, repository = make_client()
+    missing = client.delete("/api/v1/project/Несуществующий", headers=auth_headers())
+    assert missing.status_code == 404
+
+    client.post(
+        "/api/v1/snapshot",
+        headers=auth_headers(),
+        json=build_snapshot_payload("Удаляемый", "2026-02-01", 1),
+    )
+    response = client.delete("/api/v1/project/Удаляемый", headers=auth_headers())
+    assert response.status_code == 200
+    assert response.json()["action"] == "delete_project"
+    assert repository.get_latest_snapshot_version("Удаляемый") == 0
