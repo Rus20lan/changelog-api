@@ -11,10 +11,13 @@ from .auth import verify_api_key
 from .logic import build_project_meta, build_snapshot_rows, compute_deltas
 from .models import (
     CHANGE_STATUSES,
+    BaselinePatchRequest,
+    BaselineRequest,
     ChangelogRequest,
     ChangelogStatusPatchRequest,
     DeleteVersionsRequest,
     SnapshotRequest,
+    StrategicRecalcRequest,
     StrategicRequest,
 )
 from .repository import ClickHouseError, ClickHouseRepository, get_repository
@@ -236,6 +239,116 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         entries = repository.list_strategic(project_name)
         return {"project_name": project_name, "count": len(entries), "entries": entries}
+
+    @app.post("/api/v1/baseline")
+    def save_baseline(
+        payload: BaselineRequest, _: AuthDep, repository: RepositoryDep
+    ) -> dict[str, Any]:
+        if repository.get_latest_snapshot_version(payload.project_name) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Проект '{payload.project_name}' не найден в базе данных",
+            )
+        entries = [entry.model_dump() for entry in payload.entries]
+        written = repository.replace_baseline(
+            payload.project_name, payload.source_snapshot, entries
+        )
+        return {
+            "status": "ok",
+            "project_name": payload.project_name,
+            "entries_saved": written,
+            "source_snapshot": payload.source_snapshot,
+        }
+
+    @app.get("/api/v1/baseline/{project_name}")
+    def get_baseline(
+        project_name: str, _: AuthDep, repository: RepositoryDep
+    ) -> dict[str, Any]:
+        if repository.get_latest_snapshot_version(project_name) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Проект '{project_name}' не найден в базе данных",
+            )
+        entries = repository.list_baseline(project_name)
+        return {
+            "project_name": project_name,
+            "count": len(entries),
+            "entries": entries,
+        }
+
+    @app.patch("/api/v1/baseline/{project_name}")
+    def patch_baseline(
+        project_name: str,
+        payload: BaselinePatchRequest,
+        _: AuthDep,
+        repository: RepositoryDep,
+    ) -> dict[str, Any]:
+        if repository.get_latest_snapshot_version(project_name) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Проект '{project_name}' не найден в базе данных",
+            )
+        if not payload.upsert and not payload.remove:
+            raise HTTPException(
+                status_code=400,
+                detail="Either upsert or remove must contain entries",
+            )
+        upsert_entries = [entry.model_dump() for entry in payload.upsert]
+        result = repository.patch_baseline(
+            project_name,
+            payload.source_snapshot,
+            upsert_entries,
+            payload.remove,
+        )
+        return {
+            "status": "ok",
+            "project_name": project_name,
+            **result,
+        }
+
+    @app.delete("/api/v1/baseline/{project_name}")
+    def delete_baseline(
+        project_name: str, _: AuthDep, repository: RepositoryDep
+    ) -> dict[str, Any]:
+        deleted = repository.delete_baseline(project_name)
+        if deleted == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Baseline для проекта '{project_name}' не найден",
+            )
+        return {
+            "status": "ok",
+            "project_name": project_name,
+            "entries_deleted": deleted,
+        }
+
+    @app.post("/api/v1/strategic/{project_name}/recalc")
+    def recalc_strategic(
+        project_name: str,
+        payload: StrategicRecalcRequest,
+        _: AuthDep,
+        repository: RepositoryDep,
+    ) -> dict[str, Any]:
+        latest_version = repository.get_latest_snapshot_version(project_name)
+        if latest_version == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Проект '{project_name}' не найден в базе данных",
+            )
+        if repository.get_snapshot_total_count(project_name, payload.snapshot_version) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Снепшот v{payload.snapshot_version} не найден",
+            )
+        result = repository.recalc_strategic_from_baseline(
+            project_name, payload.snapshot_version
+        )
+        return {
+            "status": "ok",
+            "project_name": project_name,
+            "snapshot_version": payload.snapshot_version,
+            **result,
+        }
 
     @app.get("/api/v1/meta/{project_name}")
     def get_meta(

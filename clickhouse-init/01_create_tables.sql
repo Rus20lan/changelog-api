@@ -37,6 +37,25 @@ PARTITION BY project_name
 ORDER BY (project_name, snapshot_version, uid)
 SETTINGS index_granularity = 256;
 
+CREATE TABLE IF NOT EXISTS changelog_db.strategic_baseline
+(
+    project_name      String,
+    uid               UInt32,
+    wbs               String DEFAULT '',
+    name              String,
+    baseline_start    Nullable(Date),
+    baseline_finish   Nullable(Date),
+    baseline_source   String DEFAULT 'manual_form',
+    source_snapshot   UInt16 DEFAULT 0,
+    user_comment      String DEFAULT '',
+    created_at        DateTime DEFAULT now(),
+    updated_at        DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY project_name
+ORDER BY (project_name, uid)
+SETTINGS index_granularity = 256;
+
 CREATE TABLE IF NOT EXISTS changelog_db.strategic_control
 (
     project_name          String,

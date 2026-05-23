@@ -65,6 +65,18 @@ CHANGELOG_COLUMNS = [
     "status",
 ]
 
+BASELINE_COLUMNS = [
+    "project_name",
+    "uid",
+    "wbs",
+    "name",
+    "baseline_start",
+    "baseline_finish",
+    "baseline_source",
+    "source_snapshot",
+    "user_comment",
+]
+
 STRATEGIC_COLUMNS = [
     "project_name",
     "uid",
@@ -324,6 +336,168 @@ class ClickHouseRepository:
         rows = self.query_rows(sql)
         return [serialize_record(row) for row in rows]
 
+    def replace_baseline(
+        self,
+        project_name: str,
+        source_snapshot: int,
+        entries: list[dict[str, Any]],
+    ) -> int:
+        escaped = escape_sql_string(project_name)
+        self._alter_delete("strategic_baseline", f"project_name = '{escaped}'")
+        if not entries:
+            return 0
+        return self._insert_baseline_entries(project_name, source_snapshot, entries)
+
+    def _insert_baseline_entries(
+        self,
+        project_name: str,
+        source_snapshot: int,
+        entries: list[dict[str, Any]],
+    ) -> int:
+        values = []
+        for entry in entries:
+            payload = {
+                "project_name": project_name,
+                "uid": int(entry["uid"]),
+                "wbs": entry.get("wbs", ""),
+                "name": entry.get("name", ""),
+                "baseline_start": entry.get("baseline_start"),
+                "baseline_finish": entry.get("baseline_finish"),
+                "baseline_source": entry.get("baseline_source", "manual_form"),
+                "source_snapshot": int(entry.get("source_snapshot", source_snapshot) or source_snapshot),
+                "user_comment": entry.get("user_comment", ""),
+            }
+            values.append(
+                "(" + ", ".join(sql_value(payload.get(column)) for column in BASELINE_COLUMNS) + ")"
+            )
+        sql = (
+            "INSERT INTO strategic_baseline ("
+            + ", ".join(BASELINE_COLUMNS)
+            + ") VALUES "
+            + ", ".join(values)
+        )
+        self.execute(sql)
+        return len(entries)
+
+    def list_baseline(self, project_name: str) -> list[dict[str, Any]]:
+        rows = self.query_rows(
+            "SELECT project_name, uid, wbs, name, baseline_start, baseline_finish, "
+            "baseline_source, source_snapshot, user_comment, created_at, updated_at "
+            "FROM strategic_baseline FINAL "
+            f"WHERE project_name = '{escape_sql_string(project_name)}' "
+            "ORDER BY uid"
+        )
+        return [serialize_record(row) for row in rows]
+
+    def get_baseline_entry(self, project_name: str, uid: int) -> dict[str, Any] | None:
+        row = self.query_row(
+            "SELECT project_name, uid, wbs, name, baseline_start, baseline_finish, "
+            "baseline_source, source_snapshot, user_comment, created_at, updated_at "
+            "FROM strategic_baseline FINAL "
+            f"WHERE project_name = '{escape_sql_string(project_name)}' AND uid = {int(uid)}"
+        )
+        return serialize_record(row) if row else None
+
+    def patch_baseline(
+        self,
+        project_name: str,
+        source_snapshot: int,
+        upsert_entries: list[dict[str, Any]],
+        remove_uids: list[int],
+    ) -> dict[str, int]:
+        escaped = escape_sql_string(project_name)
+        upserted_uids = [int(entry["uid"]) for entry in upsert_entries]
+        affected_uids = sorted(set(upserted_uids) | set(int(uid) for uid in remove_uids))
+        if affected_uids:
+            ids_clause = ", ".join(str(uid) for uid in affected_uids)
+            self._alter_delete(
+                "strategic_baseline",
+                f"project_name = '{escaped}' AND uid IN ({ids_clause})",
+            )
+        added = 0
+        if upsert_entries:
+            added = self._insert_baseline_entries(project_name, source_snapshot, upsert_entries)
+        return {"upserted": added, "removed": len(remove_uids)}
+
+    def delete_baseline(self, project_name: str) -> int:
+        escaped = escape_sql_string(project_name)
+        count = int(
+            self.query_scalar(
+                "SELECT count() AS value FROM strategic_baseline FINAL "
+                f"WHERE project_name = '{escaped}'"
+            )
+            or 0
+        )
+        self._alter_delete("strategic_baseline", f"project_name = '{escaped}'")
+        self._alter_delete("strategic_control", f"project_name = '{escaped}'")
+        return count
+
+    def recalc_strategic_from_baseline(
+        self, project_name: str, snapshot_version: int
+    ) -> dict[str, Any]:
+        baseline_entries = self.list_baseline(project_name)
+        if not baseline_entries:
+            return {
+                "entries_written": 0,
+                "delays": 0,
+                "ahead": 0,
+                "over_30_days": 0,
+                "escalations": 0,
+            }
+
+        snapshot_rows = self.get_snapshot_rows(project_name, snapshot_version)
+        snapshot_by_uid = {int(row["uid"]): row for row in snapshot_rows}
+
+        escaped = escape_sql_string(project_name)
+        self._alter_delete("strategic_control", f"project_name = '{escaped}'")
+
+        entries: list[dict[str, Any]] = []
+        delays = 0
+        ahead = 0
+        over_30 = 0
+        escalations = 0
+        for baseline in baseline_entries:
+            uid = int(baseline["uid"])
+            snapshot_row = snapshot_by_uid.get(uid)
+            current_finish = snapshot_row.get("finish") if snapshot_row else None
+            baseline_finish = baseline.get("baseline_finish")
+            delta = date_diff(baseline_finish, current_finish)
+            if delta > 0:
+                delays += 1
+            elif delta < 0:
+                ahead += 1
+            if abs(delta) > 30:
+                over_30 += 1
+            escalation = delta > 0
+            if escalation:
+                escalations += 1
+            entries.append(
+                {
+                    "project_name": project_name,
+                    "uid": uid,
+                    "wbs": baseline.get("wbs", ""),
+                    "name": baseline.get("name", ""),
+                    "summary": (snapshot_row.get("summary", "Y") if snapshot_row else "Y"),
+                    "baseline_finish": baseline_finish,
+                    "current_finish": current_finish,
+                    "delta_baseline_days": delta,
+                    "escalation": escalation,
+                    "ai_strategic_analysis": "",
+                    "snapshot_version": snapshot_version,
+                }
+            )
+
+        if entries:
+            self.insert_strategic_entries(entries)
+
+        return {
+            "entries_written": len(entries),
+            "delays": delays,
+            "ahead": ahead,
+            "over_30_days": over_30,
+            "escalations": escalations,
+        }
+
     def insert_strategic_entries(self, entries: list[dict[str, Any]]) -> None:
         values = []
         for entry in entries:
@@ -363,7 +537,13 @@ class ClickHouseRepository:
         return [serialize_record(row) for row in rows]
 
     def purge_all_data(self) -> dict[str, bool]:
-        tables = ["snapshots", "project_meta", "strategic_control", "change_log"]
+        tables = [
+            "snapshots",
+            "project_meta",
+            "strategic_baseline",
+            "strategic_control",
+            "change_log",
+        ]
         for table_name in tables:
             self._alter_delete(table_name, "1 = 1")
         return {table_name: True for table_name in tables}
@@ -371,7 +551,13 @@ class ClickHouseRepository:
     def delete_project_data(self, project_name: str) -> None:
         escaped = escape_sql_string(project_name)
         condition = f"project_name = '{escaped}'"
-        for table_name in ["snapshots", "project_meta", "strategic_control", "change_log"]:
+        for table_name in [
+            "snapshots",
+            "project_meta",
+            "strategic_baseline",
+            "strategic_control",
+            "change_log",
+        ]:
             self._alter_delete(table_name, condition)
 
     def _get_project_versions_numbers(self, project_name: str) -> list[int]:
@@ -416,36 +602,6 @@ class ClickHouseRepository:
             "total_resources": int(existing_meta.get("total_resources", 0) or 0),
         }
 
-    def _rebuild_strategic_for_latest_version(self, project_name: str, latest_version: int) -> None:
-        escaped = escape_sql_string(project_name)
-        self._alter_delete("strategic_control", f"project_name = '{escaped}'")
-
-        rows = self.get_snapshot_rows(project_name, latest_version)
-        entries = []
-        for row in rows:
-            if row.get("summary", "N") != "Y":
-                continue
-            entries.append(
-                {
-                    "project_name": project_name,
-                    "uid": int(row["uid"]),
-                    "wbs": row.get("wbs", ""),
-                    "name": row.get("name", ""),
-                    "summary": row.get("summary", "N"),
-                    "baseline_finish": row.get("baseline_finish"),
-                    "current_finish": row.get("finish"),
-                    "delta_baseline_days": date_diff(
-                        row.get("baseline_finish"), row.get("finish")
-                    ),
-                    "escalation": date_diff(row.get("baseline_finish"), row.get("finish")) != 0,
-                    "ai_strategic_analysis": "",
-                    "snapshot_version": latest_version,
-                }
-            )
-
-        if entries:
-            self.insert_strategic_entries(entries)
-
     def delete_project_versions(self, project_name: str, versions: list[int]) -> dict[str, Any]:
         escaped = escape_sql_string(project_name)
         existing_versions = self._get_project_versions_numbers(project_name)
@@ -489,6 +645,7 @@ class ClickHouseRepository:
 
         if not remaining_versions:
             self._alter_delete("project_meta", f"project_name = '{escaped}'")
+            self._alter_delete("strategic_baseline", f"project_name = '{escaped}'")
             self._alter_delete("strategic_control", f"project_name = '{escaped}'")
         else:
             latest_remaining = max(remaining_versions)
@@ -496,7 +653,7 @@ class ClickHouseRepository:
                 self._build_project_meta_from_latest_snapshot(project_name, latest_remaining)
             )
             if deleted_latest:
-                self._rebuild_strategic_for_latest_version(project_name, latest_remaining)
+                self.recalc_strategic_from_baseline(project_name, latest_remaining)
 
         return {
             "status": "ok",

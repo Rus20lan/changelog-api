@@ -170,3 +170,40 @@ class StrategicRequest(BaseSchema):
 
 class DeleteVersionsRequest(BaseSchema):
     versions: list[int] = Field(min_length=1)
+
+
+BASELINE_SOURCES = {"mpp_baseline_fields", "current_dates", "manual_form"}
+
+
+class BaselineEntryIn(BaseSchema):
+    uid: int
+    wbs: str = ""
+    name: str
+    baseline_start: date | None = None
+    baseline_finish: date | None = None
+    baseline_source: Literal["mpp_baseline_fields", "current_dates", "manual_form"] = "manual_form"
+    user_comment: str = ""
+
+    _normalize_dates = field_validator(
+        "baseline_start", "baseline_finish", mode="before"
+    )(normalize_nullable_date)
+
+
+class BaselineRequest(BaseSchema):
+    project_name: str
+    source_snapshot: int = 0
+    entries: list[BaselineEntryIn] = Field(min_length=1)
+
+
+class BaselinePatchEntryIn(BaselineEntryIn):
+    pass
+
+
+class BaselinePatchRequest(BaseSchema):
+    source_snapshot: int = 0
+    upsert: list[BaselinePatchEntryIn] = Field(default_factory=list)
+    remove: list[int] = Field(default_factory=list)
+
+
+class StrategicRecalcRequest(BaseSchema):
+    snapshot_version: int = Field(ge=1)
